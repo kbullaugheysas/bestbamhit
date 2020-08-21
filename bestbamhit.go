@@ -9,13 +9,12 @@ import (
 	"log"
 	"math/rand"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
 
 type Args struct {
-	MinLength    int
+	MinScore     int
 	MaxDist      int
 	Limit        int
 	Penalty      float64
@@ -26,7 +25,7 @@ type Args struct {
 
 type Hit struct {
 	Index  int
-	Record []string
+	Record BamRecord
 }
 
 var args = Args{}
@@ -34,7 +33,7 @@ var logger *log.Logger
 
 func init() {
 	log.SetFlags(0)
-	flag.IntVar(&args.MinLength, "min-len", 60, "min length for an alignment")
+	flag.IntVar(&args.MinScore, "min-score", 60, "min alignment score for an alignment")
 	flag.IntVar(&args.MaxDist, "max-dist", 5, "max edit distance for an alignment")
 	flag.IntVar(&args.Limit, "limit", 0, "limit the number of sample reads considered (0 = no limit)")
 	flag.Float64Var(&args.Penalty, "edit-penalty", 2.0, "multiple for how to penalize edit distance")
@@ -51,22 +50,6 @@ func init() {
 func benchmark(start time.Time, label string) {
 	elapsed := time.Since(start)
 	logger.Printf("%s took %s", label, elapsed)
-}
-
-func extract(row []string) (int, int, error) {
-	if len(row) < 15 {
-		return 0, 0, fmt.Errorf("too few fields")
-	}
-	match_len := len(row[9])
-	edit_tag := row[14]
-	if edit_tag[:5] != "nM:i:" {
-		return 0, 0, fmt.Errorf("malformed edit distance tag: %s", edit_tag)
-	}
-	edit_dist, err := strconv.Atoi(edit_tag[5:])
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to parse edit dist: %s", edit_tag)
-	}
-	return match_len, edit_dist, nil
 }
 
 func OpenLogger() {
@@ -143,10 +126,12 @@ func main() {
 
 	total_mappings := 0
 	too_diverged := 0
-	too_short := 0
+	tooLow := 0
 	found := 0
 	ercc := 0
 	multi := 0
+	totalMatchLen := 0
+	accepted := 0
 	counts := make([]int, len(bams))
 
 	err = func() error {
@@ -200,7 +185,11 @@ func main() {
 					if record == nil || record[0] != read {
 						break
 					}
-					hit := Hit{Index: i, Record: record}
+					hit := Hit{Index: i}
+					err = hit.Record.Load(record)
+					if err != nil {
+						return err
+					}
 					hits = append(hits, hit)
 					s.Ratchet()
 				}
@@ -211,14 +200,10 @@ func main() {
 			total_mappings += len(hits)
 
 			// Determine which of the hits has the best alignment
-			var best_score float64
+			var best_score int
 			var which_best []int
 			for j, hit := range hits {
-				mlen, edist, err := extract(hit.Record)
-				if err != nil {
-					return err
-				}
-				score := float64(mlen) - float64(edist)*args.Penalty
+				score := hit.Record.TagAS
 				if len(which_best) == 0 {
 					best_score = score
 					which_best = append(which_best, j)
@@ -248,22 +233,24 @@ func main() {
 				best = which_best[0]
 			}
 			// Check if it's ERCC
-			if strings.Contains(hits[best].Record[2], "ERCC") {
+			if strings.Contains(hits[best].Record.Rname, "ERCC") {
 				ercc++
 			} else {
-				best_hit := hits[best]
-				mlen, edist, err := extract(best_hit.Record)
+				bestHit := hits[best]
+				mlen := bestHit.Record.MatchLength
 				if err != nil {
 					return err
 				}
-				if edist > args.MaxDist {
+				if bestHit.Record.TagnM > args.MaxDist {
 					too_diverged++
-				} else if mlen < args.MinLength {
-					too_short++
+				} else if bestHit.Record.TagAS < args.MinScore {
+					tooLow++
 				} else {
-					counts[best_hit.Index] += 1
+					totalMatchLen += mlen
+					accepted += 1
+					counts[bestHit.Index] += 1
 					if keep_writer != nil {
-						fmt.Fprintf(keep_writer, "%s\t%s\n", hits[best].Record[0], labels[best_hit.Index])
+						fmt.Fprintf(keep_writer, "%s\t%s\n", hits[best].Record.Qname, labels[bestHit.Index])
 					}
 				}
 			}
@@ -274,14 +261,17 @@ func main() {
 		logger.Fatal(err)
 	}
 
+	avgMatchLen := float64(totalMatchLen) / float64(accepted)
+
 	logger.Printf("total\t%d\n", total_mappings)
-	logger.Printf("too short\t%d\n", too_short)
+	logger.Printf("score too low\t%d\n", tooLow)
 	logger.Printf("too diverged\t%d\n", too_diverged)
 	logger.Printf("reads\t%d\n", found)
 	logger.Printf("ercc\t%d\n", ercc)
 	logger.Printf("multi\t%d\n", multi)
+	logger.Printf("average match length\t%f\n", avgMatchLen)
 
-	stats := []int{total_mappings, too_short, too_diverged, found, ercc, multi}
+	stats := []int{total_mappings, tooLow, too_diverged, found, ercc, multi}
 	for c, count := range counts {
 		logger.Printf("%s\t%d\n", labels[c], count)
 		stats = append(stats, count)

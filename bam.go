@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -19,6 +21,75 @@ type BamScanner struct {
 	prev       string
 	record     []string
 	Closed     bool
+}
+
+type BamRecord struct {
+	Qname       string
+	Flag        int
+	Rname       string
+	Pos         int
+	Mapq        int
+	Cigar       string
+	Rnext       string
+	Pnext       int
+	Seq         string
+	Qual        string
+	TagAS       int
+	TagHI       int
+	TagnM       int
+	MatchLength int
+}
+
+var cigarPattern *regexp.Regexp = regexp.MustCompile(`[0-9][0-9]*[A-Z]`)
+
+func (r *BamRecord) Load(record []string) error {
+	r.Qname = record[0]
+	r.Rname = record[2]
+	r.Cigar = record[5]
+	r.Rnext = record[6]
+	r.Seq = record[9]
+	r.Qual = record[10]
+	var err error
+	if r.Flag, err = strconv.Atoi(record[1]); err != nil {
+		return err
+	}
+	if r.Pos, err = strconv.Atoi(record[3]); err != nil {
+		return err
+	}
+	if r.Mapq, err = strconv.Atoi(record[4]); err != nil {
+		return err
+	}
+	if r.Pnext, err = strconv.Atoi(record[7]); err != nil {
+		return err
+	}
+	for i := 11; i < len(record); i++ {
+		val, err := strconv.Atoi(record[i][5:])
+		if err != nil {
+			return fmt.Errorf("failed to parse tag: %s", record[i])
+		}
+		switch record[i][0:5] {
+		case "AS:i:":
+			r.TagAS = val
+		case "HI:i:":
+			r.TagHI = val
+		case "nM:i:":
+			r.TagnM = val
+		}
+	}
+
+	matches := cigarPattern.FindAllStringSubmatch(r.Cigar, -1)
+	for _, match := range matches {
+		code := match[0]
+		if len(code) > 0 && code[len(code)-1] == 'M' {
+			n, err := strconv.Atoi(code[0:(len(code) - 1)])
+			if err != nil {
+				return fmt.Errorf("failed to parse cigar fragment: %s", code)
+			}
+			r.MatchLength += n
+		}
+	}
+
+	return nil
 }
 
 func OpenBam(bamfile string) (*BamScanner, error) {
